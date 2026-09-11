@@ -1,4 +1,9 @@
-# Audio Angel v1.0
+<table>
+  <tr>
+    <td><img width="100" height="100" alt="Logo" src="https://github.com/user-attachments/assets/c46f847e-2a5d-4c9e-955e-f3a88d50e523" /></td>
+    <td><h1>Audio Angel v1.0</h1></td>
+  </tr>
+</table>
 
 ![Audio Angel's main window: four input strips (Vocal Mic, Yamaha Piano, Mac / iPad, Zoom) and two output strips (Teacher, Student)](docs/screenshot.png)
 
@@ -221,6 +226,8 @@ nothing is left behind.
   Core Audio driver (AudioServerPlugIn), deliberately not in this version.
 - A dedicated iPad input would mean capturing the iPad directly; it may compete
   with OBS for the device, so it needs testing outside a lesson first.
+
+Hey, Philip here. I'm just writing a few words so Github registers me as an actual Author :p 
 
 ## Licence
 
