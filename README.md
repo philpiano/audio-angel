@@ -1,4 +1,4 @@
-<img width="1254" height="1254" alt="Logo" src="https://github.com/user-attachments/assets/c46f847e-2a5d-4c9e-955e-f3a88d50e523" />
+<img width="314" height="314" alt="Logo" src="https://github.com/user-attachments/assets/c46f847e-2a5d-4c9e-955e-f3a88d50e523" />
 
 # Audio Angel v1.0
 
