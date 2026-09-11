@@ -221,3 +221,5 @@ nothing is left behind.
   Core Audio driver (AudioServerPlugIn), deliberately not in this version.
 - A dedicated iPad input would mean capturing the iPad directly; it may compete
   with OBS for the device, so it needs testing outside a lesson first.
+
+Hey, Philip here. I'm just writing a few words so Github registers me as an actual Author :p 
