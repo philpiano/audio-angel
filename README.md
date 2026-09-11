@@ -1,9 +1,4 @@
-<table>
-  <tr>
-    <td><img width="100" height="100" alt="Logo" src="https://github.com/user-attachments/assets/c46f847e-2a5d-4c9e-955e-f3a88d50e523" /></td>
-    <td><h1>Audio Angel v1.0</h1></td>
-  </tr>
-</table>
+# Audio Angel v1.0
 
 ![Audio Angel's main window: four input strips (Vocal Mic, Yamaha Piano, Mac / iPad, Zoom) and two output strips (Teacher, Student)](docs/screenshot.png)
 
@@ -227,4 +222,10 @@ nothing is left behind.
 - A dedicated iPad input would mean capturing the iPad directly; it may compete
   with OBS for the device, so it needs testing outside a lesson first.
 
-Hey, Philip here. I'm just writing a few words so Github registers me as an actual Author :p 
+## Licence
+
+MIT: use it, change it, share it, including commercially. Just keep the copyright
+notice. See [LICENSE](LICENSE).
+
+BlackHole, which Audio Angel relies on but does not include, is a separate project
+with its own licence (GPL-3.0).
