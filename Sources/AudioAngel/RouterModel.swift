@@ -1,0 +1,269 @@
+import AppKit
+import AVFoundation
+import RouterCore
+import SwiftUI
+
+enum SlotHealth {
+    case unassigned, offline, badChannels, ok
+
+    var color: Color {
+        switch self {
+        case .ok: return .green
+        case .unassigned: return .gray
+        case .offline: return .orange
+        case .badChannels: return .red
+        }
+    }
+
+    var help: String {
+        switch self {
+        case .ok: return "Connected"
+        case .unassigned: return "No device chosen"
+        case .offline: return "Device not connected — it will reconnect automatically"
+        case .badChannels: return "That device doesn't have these channels"
+        }
+    }
+}
+
+/// The app's state: the saved routing config, the device list, and the engine.
+final class RouterModel: ObservableObject {
+    static weak var current: RouterModel?
+
+    @Published var config: RouterConfig {
+        didSet {
+            guard config != oldValue else { return }
+            engine.update(config: config)
+            scheduleSave()
+        }
+    }
+    @Published private(set) var devices: [AudioDeviceInfo] = []
+    @Published private(set) var status = EngineStatus()
+    @Published private(set) var overloads = 0
+    @Published private(set) var defaultOutputUID: String?
+    @Published private(set) var micPermission: AVAuthorizationStatus = .notDetermined
+
+    let engine = EngineController()
+    let meters: MeterStore
+    private var saveItem: DispatchWorkItem?
+    private var activity: NSObjectProtocol?
+
+    /// `live: false` builds the model for a UI snapshot: no audio, no permission
+    /// prompt, nothing saved.
+    init(live: Bool = true) {
+        meters = MeterStore(core: engine.core)
+        let found = AudioDeviceInfo.all()
+        devices = found
+        config = RouterConfig.load() ?? RouterConfig.makeDefault(devices: found)
+        defaultOutputUID = CA.defaultOutputDevice().flatMap(CA.uid(of:))
+        micPermission = AVCaptureDevice.authorizationStatus(for: .audio) // reading it never prompts
+        guard live else { return }
+        RouterModel.current = self
+
+        engine.onStatus = { [weak self] in self?.status = $0 }
+        engine.onOverload = { [weak self] in self?.overloads += 1 }
+        engine.onSystemDevicesChanged = { [weak self] in self?.refreshDevices() }
+
+        // Audio must never be throttled by App Nap, even with the window hidden.
+        activity = ProcessInfo.processInfo.beginActivity(
+            options: [.userInitiated, .latencyCritical],
+            reason: "Routing live audio")
+
+        // USB devices re-enumerate after sleep; rebuild once they're back.
+        NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didWakeNotification, object: nil, queue: .main
+        ) { [weak self] _ in self?.engine.restart(after: 2) }
+
+        config.save()
+        engine.update(config: config)
+        engine.start()
+        checkMicPermission()
+    }
+
+    func shutdown() {
+        saveItem?.perform()
+        config.save()
+        engine.shutdown()
+        meters.stop()
+    }
+
+    // MARK: - Devices
+
+    func resetOverloads() { overloads = 0 }
+
+    /// README screenshots only (`--snapshot FILE --demo`): show the desk as it looks on
+    /// a working rig, with every assigned device switched on. No audio is started.
+    func showForScreenshot(_ status: EngineStatus) {
+        self.status = status
+        micPermission = .authorized
+        // Stand in for assigned devices that happen to be switched off right now.
+        var present = Set(devices.map(\.uid))
+        for (slot, isInput) in config.inputs.map({ ($0, true) }) + config.outputs.map({ ($0, false) }) {
+            guard let uid = slot.deviceUID, !present.contains(uid) else { continue }
+            present.insert(uid)
+            let channels = max(slot.firstChannel + slot.width, 2)
+            devices.append(AudioDeviceInfo(
+                objectID: 0, uid: uid, name: slot.deviceName ?? slot.name,
+                inputChannels: isInput ? channels : 0, outputChannels: isInput ? 0 : channels,
+                transport: kAudioDeviceTransportTypeUSB, sampleRate: 48000))
+        }
+    }
+
+    func refreshDevices() {
+        devices = AudioDeviceInfo.all()
+        defaultOutputUID = CA.defaultOutputDevice().flatMap(CA.uid(of:))
+    }
+
+    func device(_ uid: String?) -> AudioDeviceInfo? {
+        guard let uid else { return nil }
+        return devices.first { $0.uid == uid }
+    }
+
+    var inputDevices: [AudioDeviceInfo] { devices.filter { $0.inputChannels > 0 } }
+    var outputDevices: [AudioDeviceInfo] { devices.filter { $0.outputChannels > 0 } }
+
+    func setSystemOutput(_ uid: String) {
+        guard let d = device(uid) else { return }
+        CA.setDefaultOutputDevice(d.objectID)
+        refreshDevices()
+    }
+
+    func health(_ slot: SlotConfig, isInput: Bool) -> SlotHealth {
+        guard let uid = slot.deviceUID else { return .unassigned }
+        guard let d = device(uid) else { return .offline }
+        let channels = isInput ? d.inputChannels : d.outputChannels
+        return slot.firstChannel + slot.width <= channels ? .ok : .badChannels
+    }
+
+    func isFeedback(_ input: SlotConfig, _ output: SlotConfig) -> Bool {
+        RouterConfig.isFeedback(input, output) { uid in self.device(uid)?.isVirtual ?? true }
+    }
+
+    // MARK: - Slots
+
+    func index(of id: UUID, isInput: Bool) -> Int? {
+        (isInput ? config.inputs : config.outputs).firstIndex { $0.id == id }
+    }
+
+    func addInput() {
+        guard config.inputs.count < RouterConfig.maxInputs else { return }
+        config.inputs.append(SlotConfig(name: "Input \(config.inputs.count + 1)", stereo: true))
+    }
+
+    func addOutput() {
+        guard config.outputs.count < RouterConfig.maxOutputs else { return }
+        config.outputs.append(SlotConfig(name: "Output \(config.outputs.count + 1)", stereo: true))
+    }
+
+    func remove(_ id: UUID, isInput: Bool) {
+        var c = config
+        if isInput { c.inputs.removeAll { $0.id == id } } else { c.outputs.removeAll { $0.id == id } }
+        let idString = id.uuidString
+        c.routes = c.routes.filter { !$0.key.contains(idString) }
+        config = c
+    }
+
+    func move(_ id: UUID, isInput: Bool, by delta: Int) {
+        var list = isInput ? config.inputs : config.outputs
+        guard let i = list.firstIndex(where: { $0.id == id }) else { return }
+        let j = i + delta
+        guard list.indices.contains(j) else { return }
+        list.swapAt(i, j)
+        if isInput { config.inputs = list } else { config.outputs = list }
+    }
+
+    func routeBinding(_ input: UUID, _ output: UUID) -> Binding<RouteState> {
+        Binding(
+            get: { self.config.route(input, output) },
+            set: { self.config.routes[RouterConfig.key(input, output)] = $0 }
+        )
+    }
+
+    // MARK: - Permission
+
+    func checkMicPermission() {
+        micPermission = AVCaptureDevice.authorizationStatus(for: .audio)
+        guard micPermission == .notDetermined else { return }
+        AVCaptureDevice.requestAccess(for: .audio) { _ in
+            DispatchQueue.main.async {
+                self.micPermission = AVCaptureDevice.authorizationStatus(for: .audio)
+                self.engine.restart(after: 0.2)
+            }
+        }
+    }
+
+    // MARK: - Saving
+
+    private func scheduleSave() {
+        saveItem?.cancel()
+        let item = DispatchWorkItem { [weak self] in self?.config.save() }
+        saveItem = item
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5, execute: item)
+    }
+}
+
+/// Meter levels, polled from the engine at 30 Hz. Kept separate from RouterModel
+/// so only the meters redraw 30 times a second, not the whole window.
+final class MeterStore: ObservableObject {
+    @Published private(set) var inputs = Array(repeating: [Float](repeating: 0, count: 2), count: RouterConfig.maxInputs)
+    @Published private(set) var outputs = Array(repeating: [Float](repeating: 0, count: 2), count: RouterConfig.maxOutputs)
+    @Published private(set) var clips: UInt64 = 0
+    /// Gain reduction in dB per input, for the effect buttons' activity lights.
+    @Published private(set) var limiting = [Float](repeating: 0, count: RouterConfig.maxInputs)
+    @Published private(set) var compressing = [Float](repeating: 0, count: RouterConfig.maxInputs)
+
+    private let core: OpaquePointer
+    private var timer: Timer?
+    private var clipBaseline: UInt64 = 0
+
+    /// The engine's clip count only ever grows; "reset" counts from here on.
+    func resetClips() {
+        clipBaseline = ar_engine_clip_count(core)
+        clips = 0
+    }
+
+    func reduction(_ i: Int, _ effect: InputEffect) -> Float {
+        guard limiting.indices.contains(i) else { return 0 }
+        switch effect {
+        case .limiter: return limiting[i]
+        case .compressor: return compressing[i]
+        case .lowCut: return 0
+        }
+    }
+
+    init(core: OpaquePointer) {
+        self.core = core
+        let timer = Timer(timeInterval: 1.0 / 30, repeats: true) { [weak self] _ in self?.tick() }
+        RunLoop.main.add(timer, forMode: .common)
+        self.timer = timer
+    }
+
+    func stop() { timer?.invalidate() }
+
+    func input(_ i: Int) -> [Float] { inputs.indices.contains(i) ? inputs[i] : [0, 0] }
+    func output(_ o: Int) -> [Float] { outputs.indices.contains(o) ? outputs[o] : [0, 0] }
+
+    private func tick() {
+        // Fast attack, ~300 ms release.
+        let release: Float = 0.82
+        var newIn = inputs, newOut = outputs
+        for i in 0..<newIn.count {
+            for c in 0..<2 { newIn[i][c] = max(ar_engine_take_input_peak(core, Int32(i), Int32(c)), newIn[i][c] * release) }
+        }
+        for o in 0..<newOut.count {
+            for c in 0..<2 { newOut[o][c] = max(ar_engine_take_output_peak(core, Int32(o), Int32(c)), newOut[o][c] * release) }
+        }
+        inputs = newIn
+        outputs = newOut
+        // Lights hold briefly so a single caught peak is visible.
+        var newLimit = limiting, newComp = compressing
+        for i in 0..<newLimit.count {
+            newLimit[i] = max(ar_engine_take_input_reduction(core, Int32(i), AR_FX_LIMITER), newLimit[i] * 0.85)
+            newComp[i] = max(ar_engine_take_input_reduction(core, Int32(i), AR_FX_COMPRESSOR), newComp[i] * 0.85)
+        }
+        if newLimit != limiting { limiting = newLimit }
+        if newComp != compressing { compressing = newComp }
+        let total = ar_engine_clip_count(core)
+        let c = total >= clipBaseline ? total - clipBaseline : 0
+        if c != clips { clips = c }
+    }
+}

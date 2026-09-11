@@ -1,0 +1,4 @@
+# Build output — rebuild with ./build.sh
+build/
+.build/
+.swiftpm/

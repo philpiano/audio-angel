@@ -1,0 +1,4 @@
+module RouterCore {
+    header "RouterCore.h"
+    export *
+}
