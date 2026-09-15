@@ -1,4 +1,6 @@
-# Build output — rebuild with ./build.sh
 build/
 .build/
 .swiftpm/
+
+# Diagnostic logs written by the app when run from build/
+logs/

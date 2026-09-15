@@ -36,6 +36,8 @@ final class RouterModel: ObservableObject {
             scheduleSave()
         }
     }
+    private var heartbeat: DiagnosticHeartbeat?
+    private var observers: [NSObjectProtocol] = []
     @Published private(set) var devices: [AudioDeviceInfo] = []
     @Published private(set) var status = EngineStatus()
     @Published private(set) var overloads = 0
@@ -59,6 +61,12 @@ final class RouterModel: ObservableObject {
         guard live else { return }
         RouterModel.current = self
 
+        DiagnosticLog.shared.start()
+        DiagnosticLog.shared.event("session_start", DiagnosticInfo.session())
+        DiagnosticLog.shared.event("config", DiagnosticInfo.config(config))
+        DiagnosticLog.shared.event("devices", ["devices": DiagnosticInfo.allDevices()])
+        lastLoggedConfig = config
+
         engine.onStatus = { [weak self] in self?.status = $0 }
         engine.onOverload = { [weak self] in self?.overloads += 1 }
         engine.onSystemDevicesChanged = { [weak self] in self?.refreshDevices() }
@@ -68,22 +76,67 @@ final class RouterModel: ObservableObject {
             options: [.userInitiated, .latencyCritical],
             reason: "Routing live audio")
 
+        let workspace = NSWorkspace.shared.notificationCenter
         // USB devices re-enumerate after sleep; rebuild once they're back.
-        NSWorkspace.shared.notificationCenter.addObserver(
-            forName: NSWorkspace.didWakeNotification, object: nil, queue: .main
-        ) { [weak self] _ in self?.engine.restart(after: 2) }
+        observers.append(workspace.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { [weak self] _ in
+            DiagnosticLog.shared.event("mac_woke")
+            self?.engine.restart(after: 2, reason: "Mac woke from sleep")
+        })
+        observeForLog()
 
         config.save()
         engine.update(config: config)
         engine.start()
         checkMicPermission()
+
+        let beat = DiagnosticHeartbeat(engine: engine, model: self)
+        beat.start()
+        heartbeat = beat
     }
 
     func shutdown() {
         saveItem?.perform()
         config.save()
+        heartbeat?.stop()
         engine.shutdown()
         meters.stop()
+        DiagnosticLog.shared.event("app_quit", ["overloads": overloads, "clips": Int(clamping: meters.clips)])
+        DiagnosticLog.shared.stop()
+    }
+
+    // MARK: - Diagnostic log
+
+    private var lastLoggedConfig: RouterConfig?
+
+    /// Things outside Audio Angel that can disturb audio, recorded when they happen.
+    private func observeForLog() {
+        let log = DiagnosticLog.shared
+        let workspace = NSWorkspace.shared.notificationCenter
+        let simple: [(Notification.Name, String)] = [
+            (NSWorkspace.willSleepNotification, "mac_will_sleep"),
+            (NSWorkspace.screensDidSleepNotification, "screens_slept"),
+            (NSWorkspace.screensDidWakeNotification, "screens_woke"),
+            (NSWorkspace.sessionDidResignActiveNotification, "user_session_inactive"),
+            (NSWorkspace.sessionDidBecomeActiveNotification, "user_session_active"),
+        ]
+        for (name, event) in simple {
+            observers.append(workspace.addObserver(forName: name, object: nil, queue: .main) { _ in log.event(event) })
+        }
+        for (name, event) in [(NSWorkspace.didLaunchApplicationNotification, "app_launched"),
+                              (NSWorkspace.didTerminateApplicationNotification, "app_terminated")] {
+            observers.append(workspace.addObserver(forName: name, object: nil, queue: .main) { note in
+                let app = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication
+                log.event(event, ["name": app?.localizedName ?? "?", "bundle_id": app?.bundleIdentifier ?? "?"])
+            })
+        }
+        observers.append(NotificationCenter.default.addObserver(
+            forName: ProcessInfo.thermalStateDidChangeNotification, object: nil, queue: .main) { _ in
+            log.event("thermal_state", ["state": DiagnosticInfo.thermal()])
+        })
+        observers.append(NotificationCenter.default.addObserver(
+            forName: .NSProcessInfoPowerStateDidChange, object: nil, queue: .main) { _ in
+            log.event("low_power_mode", ["on": ProcessInfo.processInfo.isLowPowerModeEnabled])
+        })
     }
 
     // MARK: - Devices
@@ -183,10 +236,11 @@ final class RouterModel: ObservableObject {
     func checkMicPermission() {
         micPermission = AVCaptureDevice.authorizationStatus(for: .audio)
         guard micPermission == .notDetermined else { return }
-        AVCaptureDevice.requestAccess(for: .audio) { _ in
+        AVCaptureDevice.requestAccess(for: .audio) { granted in
             DispatchQueue.main.async {
                 self.micPermission = AVCaptureDevice.authorizationStatus(for: .audio)
-                self.engine.restart(after: 0.2)
+                DiagnosticLog.shared.event("microphone_permission", ["granted": granted])
+                self.engine.restart(after: 0.2, reason: "microphone permission answered")
             }
         }
     }
@@ -195,7 +249,15 @@ final class RouterModel: ObservableObject {
 
     private func scheduleSave() {
         saveItem?.cancel()
-        let item = DispatchWorkItem { [weak self] in self?.config.save() }
+        let item = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            self.config.save()
+            // Settle-then-log, so a fader drag is one entry, not hundreds.
+            if self.config != self.lastLoggedConfig {
+                self.lastLoggedConfig = self.config
+                DiagnosticLog.shared.event("config", DiagnosticInfo.config(self.config))
+            }
+        }
         saveItem = item
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.5, execute: item)
     }
@@ -214,6 +276,20 @@ final class MeterStore: ObservableObject {
     private let core: OpaquePointer
     private var timer: Timer?
     private var clipBaseline: UInt64 = 0
+
+    /// The loudest level of each strip since the diagnostic heartbeat last asked.
+    private var logIn = [Float](repeating: 0, count: RouterConfig.maxInputs)
+    private var logOut = [Float](repeating: 0, count: RouterConfig.maxOutputs)
+    private var logLimit = [Float](repeating: 0, count: RouterConfig.maxInputs)
+    private var logComp = [Float](repeating: 0, count: RouterConfig.maxInputs)
+
+    func takeLogLevels() -> (inputs: [Float], outputs: [Float], limiting: [Float], compressing: [Float]) {
+        defer {
+            logIn = logIn.map { _ in 0 }; logOut = logOut.map { _ in 0 }
+            logLimit = logLimit.map { _ in 0 }; logComp = logComp.map { _ in 0 }
+        }
+        return (logIn, logOut, logLimit, logComp)
+    }
 
     /// The engine's clip count only ever grows; "reset" counts from here on.
     func resetClips() {
@@ -247,18 +323,30 @@ final class MeterStore: ObservableObject {
         let release: Float = 0.82
         var newIn = inputs, newOut = outputs
         for i in 0..<newIn.count {
-            for c in 0..<2 { newIn[i][c] = max(ar_engine_take_input_peak(core, Int32(i), Int32(c)), newIn[i][c] * release) }
+            for c in 0..<2 {
+                let peak = ar_engine_take_input_peak(core, Int32(i), Int32(c))
+                logIn[i] = max(logIn[i], peak)
+                newIn[i][c] = max(peak, newIn[i][c] * release)
+            }
         }
         for o in 0..<newOut.count {
-            for c in 0..<2 { newOut[o][c] = max(ar_engine_take_output_peak(core, Int32(o), Int32(c)), newOut[o][c] * release) }
+            for c in 0..<2 {
+                let peak = ar_engine_take_output_peak(core, Int32(o), Int32(c))
+                logOut[o] = max(logOut[o], peak)
+                newOut[o][c] = max(peak, newOut[o][c] * release)
+            }
         }
         inputs = newIn
         outputs = newOut
         // Lights hold briefly so a single caught peak is visible.
         var newLimit = limiting, newComp = compressing
         for i in 0..<newLimit.count {
-            newLimit[i] = max(ar_engine_take_input_reduction(core, Int32(i), AR_FX_LIMITER), newLimit[i] * 0.85)
-            newComp[i] = max(ar_engine_take_input_reduction(core, Int32(i), AR_FX_COMPRESSOR), newComp[i] * 0.85)
+            let lim = ar_engine_take_input_reduction(core, Int32(i), AR_FX_LIMITER)
+            let comp = ar_engine_take_input_reduction(core, Int32(i), AR_FX_COMPRESSOR)
+            logLimit[i] = max(logLimit[i], lim)
+            logComp[i] = max(logComp[i], comp)
+            newLimit[i] = max(lim, newLimit[i] * 0.85)
+            newComp[i] = max(comp, newComp[i] * 0.85)
         }
         if newLimit != limiting { limiting = newLimit }
         if newComp != compressing { compressing = newComp }

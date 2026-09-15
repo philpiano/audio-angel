@@ -1,5 +1,6 @@
 #include "RouterCore.h"
 
+#include <mach/mach_time.h>
 #include <math.h>
 #include <stdatomic.h>
 #include <stdlib.h>
@@ -72,6 +73,17 @@ struct ar_engine {
     _Atomic uint64_t callbacks;
     _Atomic uint64_t clip_events;
 
+    // Diagnostics: written by the audio thread, taken by the diagnostic log.
+    _Atomic uint64_t last_cb_time;
+    _Atomic uint64_t first_cb_time;
+    _Atomic uint64_t max_cb_interval;
+    _Atomic uint64_t max_process_time;
+    _Atomic uint64_t missing_buffers;
+    uint32_t in_zero_run[AR_MAX_INPUTS];   // audio thread only
+    uint32_t out_zero_run[AR_MAX_OUTPUTS]; // audio thread only
+    _Atomic uint32_t in_max_zero_run[AR_MAX_INPUTS];
+    _Atomic uint32_t out_max_zero_run[AR_MAX_OUTPUTS];
+
     AudioObjectID device;
     AudioDeviceIOProcID proc;
     _Atomic bool running;
@@ -130,6 +142,13 @@ ar_engine *ar_engine_create(void) {
     }
     atomic_init(&e->callbacks, 0);
     atomic_init(&e->clip_events, 0);
+    atomic_init(&e->last_cb_time, 0);
+    atomic_init(&e->first_cb_time, 0);
+    atomic_init(&e->max_cb_interval, 0);
+    atomic_init(&e->max_process_time, 0);
+    atomic_init(&e->missing_buffers, 0);
+    for (int i = 0; i < AR_MAX_INPUTS; i++) atomic_init(&e->in_max_zero_run[i], 0u);
+    for (int o = 0; o < AR_MAX_OUTPUTS; o++) atomic_init(&e->out_max_zero_run[o], 0u);
     atomic_init(&e->running, false);
     return e;
 }
@@ -226,6 +245,28 @@ float ar_engine_take_input_reduction(ar_engine *e, int in, uint32_t effect) {
 uint64_t ar_engine_callback_count(ar_engine *e) { return atomic_load_explicit(&e->callbacks, RLX); }
 uint64_t ar_engine_clip_count(ar_engine *e) { return atomic_load_explicit(&e->clip_events, RLX); }
 
+uint64_t ar_engine_last_callback_time(ar_engine *e) { return atomic_load_explicit(&e->last_cb_time, RLX); }
+uint64_t ar_engine_first_callback_time(ar_engine *e) { return atomic_load_explicit(&e->first_cb_time, RLX); }
+uint64_t ar_engine_take_max_callback_interval(ar_engine *e) { return atomic_exchange_explicit(&e->max_cb_interval, 0, RLX); }
+uint64_t ar_engine_take_max_process_time(ar_engine *e) { return atomic_exchange_explicit(&e->max_process_time, 0, RLX); }
+uint64_t ar_engine_missing_buffer_count(ar_engine *e) { return atomic_load_explicit(&e->missing_buffers, RLX); }
+
+uint32_t ar_engine_take_input_zero_run(ar_engine *e, int in) {
+    return valid_in(in) ? atomic_exchange_explicit(&e->in_max_zero_run[in], 0u, RLX) : 0u;
+}
+uint32_t ar_engine_take_output_zero_run(ar_engine *e, int out) {
+    return valid_out(out) ? atomic_exchange_explicit(&e->out_max_zero_run[out], 0u, RLX) : 0u;
+}
+
+static inline void raise_u64(_Atomic uint64_t *p, uint64_t v) {
+    if (v > atomic_load_explicit(p, RLX)) atomic_store_explicit(p, v, RLX);
+}
+
+static inline void track_zero_run(uint32_t *run, _Atomic uint32_t *max, bool silent, uint32_t n) {
+    *run = silent ? (*run > UINT32_MAX - n ? UINT32_MAX : *run + n) : 0u;
+    if (*run > atomic_load_explicit(max, RLX)) atomic_store_explicit(max, *run, RLX);
+}
+
 static inline void raise_peak(_Atomic float *p, float v) {
     if (v > ldf(p)) stf(p, v);
 }
@@ -263,25 +304,32 @@ static inline float smooth_toward(float cur, float target, float coef) {
 }
 
 // De-interleave one input slot into in_buf, dropping garbage samples.
-static void gather_input(ar_engine *e, int i, const AudioBufferList *in, uint32_t offset, uint32_t n) {
+// Flags a missing or short buffer, and tracks runs of exact digital silence.
+static void gather_input(ar_engine *e, int i, const AudioBufferList *in, uint32_t offset, uint32_t n,
+                         bool *missing) {
     const ar_map *m = &e->in_map[i];
+    bool silent = true;
     for (int c = 0; c < m->n; c++) {
         float *dst = e->in_buf[i][c];
         const AudioBuffer *b = resolve(in, m->c[c]);
         if (!b) {
             memset(dst, 0, n * sizeof(float));
+            *missing = true;
             continue;
         }
         const uint32_t stride = b->mNumberChannels;
         const uint32_t avail = buf_frames(b);
+        if (avail < offset + n) *missing = true;
         const float *src = (const float *)b->mData + m->c[c].ch;
         for (uint32_t k = 0; k < n; k++) {
             const uint32_t f = offset + k;
             float x = (f < avail) ? src[(size_t)f * stride] : 0.0f;
             if (!(fabsf(x) <= AR_INPUT_SANITY)) x = 0.0f; // also catches NaN/Inf
+            if (x != 0.0f) silent = false;
             dst[k] = x;
         }
     }
+    track_zero_run(&e->in_zero_run[i], &e->in_max_zero_run[i], silent, n);
 }
 
 // Compressor static curve: gain change in dB for a level in dB (soft knee).
@@ -384,7 +432,7 @@ static void process_strip(ar_engine *e, int i, uint32_t n, float g0, float g1, f
 
 // Mix every routed input into one output slot and add it to the hardware buffer.
 static void mix_output(ar_engine *e, int o, AudioBufferList *out,
-                       uint32_t offset, uint32_t n, float coef) {
+                       uint32_t offset, uint32_t n, float coef, bool *missing) {
     const ar_map *om = &e->out_map[o];
     const int no = om->n;
     const float og = atomic_load_explicit(&e->out_mute[o], RLX) ? 0.0f : clean_gain(ldf(&e->out_gain[o]));
@@ -418,6 +466,7 @@ static void mix_output(ar_engine *e, int o, AudioBufferList *out,
         }
     }
 
+    bool silent = true;
     for (int c = 0; c < no; c++) {
         const float *s = e->mix_buf[c];
         float peak = 0.0f;
@@ -425,18 +474,24 @@ static void mix_output(ar_engine *e, int o, AudioBufferList *out,
             const float a = fabsf(s[k]);
             if (a > peak) peak = a;
         }
+        if (peak != 0.0f) silent = false;
         raise_peak(&e->out_peak[o][c], peak > 1.0f ? 1.0f : peak);
 
         const AudioBuffer *cb = resolve(out, om->c[c]);
-        if (!cb) continue;
+        if (!cb) {
+            *missing = true;
+            continue;
+        }
         const uint32_t stride = cb->mNumberChannels;
         const uint32_t avail = buf_frames(cb);
+        if (avail < offset + n) *missing = true;
         float *dst = (float *)cb->mData + om->c[c].ch;
         for (uint32_t k = 0; k < n; k++) {
             const uint32_t f = offset + k;
             if (f < avail) dst[(size_t)f * stride] += s[k];
         }
     }
+    track_zero_run(&e->out_zero_run[o], &e->out_max_zero_run[o], silent, n);
 }
 
 // Transparent below the knee, smooth tanh saturation above it, never past 1.0.
@@ -460,9 +515,25 @@ static void safety_clip(ar_engine *e, AudioBufferList *out) {
     if (clipped) atomic_fetch_add_explicit(&e->clip_events, 1, RLX);
 }
 
+static void render(ar_engine *e, const AudioBufferList *in, AudioBufferList *out);
+
 void ar_engine_process(ar_engine *e, const AudioBufferList *in, AudioBufferList *out) {
     if (!e) return;
+    // mach_absolute_time is a plain register read: safe on the audio thread.
+    const uint64_t began = mach_absolute_time();
+    const uint64_t previous = atomic_load_explicit(&e->last_cb_time, RLX);
+    atomic_store_explicit(&e->last_cb_time, began, RLX);
+    if (previous != 0 && began > previous) raise_u64(&e->max_cb_interval, began - previous);
+    if (atomic_load_explicit(&e->first_cb_time, RLX) == 0) atomic_store_explicit(&e->first_cb_time, began, RLX);
     atomic_fetch_add_explicit(&e->callbacks, 1, RLX);
+
+    render(e, in, out);
+
+    const uint64_t ended = mach_absolute_time();
+    if (ended > began) raise_u64(&e->max_process_time, ended - began);
+}
+
+static void render(ar_engine *e, const AudioBufferList *in, AudioBufferList *out) {
 
     // The HAL does not promise zeroed output buffers. Every channel we don't
     // write (including loopback devices we only read from) must be silence.
@@ -476,6 +547,7 @@ void ar_engine_process(ar_engine *e, const AudioBufferList *in, AudioBufferList 
     if (frames == 0) return;
 
     const float sr = e->sample_rate > 0.0f ? e->sample_rate : 48000.0f;
+    bool missing = false;
     for (uint32_t offset = 0; offset < frames; offset += AR_BLOCK) {
         const uint32_t n = (frames - offset) < AR_BLOCK ? (frames - offset) : AR_BLOCK;
         const float coef = 1.0f - expf(-(float)n / (AR_SMOOTH_SECONDS * sr));
@@ -485,15 +557,16 @@ void ar_engine_process(ar_engine *e, const AudioBufferList *in, AudioBufferList 
             const float g0 = e->cur_in[i];
             const float g1 = smooth_toward(g0, clean_gain(ldf(&e->in_gain[i])), coef);
             e->cur_in[i] = g1;
-            gather_input(e, i, in, offset, n);
+            gather_input(e, i, in, offset, n, &missing);
             process_strip(e, i, n, g0, g1, coef);
         }
         for (int o = 0; o < AR_MAX_OUTPUTS; o++) {
             if (e->out_map[o].n == 0) continue;
-            mix_output(e, o, out, offset, n, coef);
+            mix_output(e, o, out, offset, n, coef, &missing);
         }
     }
 
+    if (missing) atomic_fetch_add_explicit(&e->missing_buffers, 1, RLX);
     if (out) safety_clip(e, out);
 }
 
@@ -516,6 +589,7 @@ OSStatus ar_engine_start(ar_engine *e, AudioObjectID device) {
     if (s != noErr) return s;
     e->device = device;
     e->proc = proc;
+    atomic_store(&e->first_cb_time, 0);
     atomic_store(&e->running, true); // before start, so topology setters refuse
     s = AudioDeviceStart(device, proc);
     if (s != noErr) {

@@ -55,7 +55,7 @@ struct MenuBarContent: View {
             openWindow(id: "main")
             NSApp.activate(ignoringOtherApps: true)
         }
-        Button("Restart Audio Engine") { model.engine.restart() }
+        Button("Restart Audio Engine") { model.engine.restart(reason: "user pressed Restart (menu bar)") }
         Divider()
         Button("Quit Audio Angel") { NSApp.terminate(nil) }
             .keyboardShortcut("q")

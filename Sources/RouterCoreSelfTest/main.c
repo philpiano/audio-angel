@@ -5,8 +5,10 @@
 
 #include "RouterCore.h"
 
+#include <mach/mach_time.h>
 #include <math.h>
 #include <stddef.h>
+#include <unistd.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -183,6 +185,49 @@ static void test_effects(void) {
     }
 }
 
+// --- Diagnostics ----------------------------------------------------------------
+
+static void test_diagnostics(void) {
+    printf("diagnostics\n");
+    fx_rig r = fx_rig_make(0);
+    CHECK(ar_engine_last_callback_time(r.e) == 0, "no callback time before the first callback");
+
+    fx_run(&r, 0, 0.0f, 1);
+    uint64_t t1 = ar_engine_last_callback_time(r.e);
+    CHECK(t1 != 0 && ar_engine_first_callback_time(r.e) == t1, "the first callback is timestamped");
+    usleep(20000);
+    fx_run(&r, 0, 0.0f, 1);
+    CHECK(ar_engine_last_callback_time(r.e) > t1, "later callbacks move the timestamp on");
+    CHECK(ar_engine_first_callback_time(r.e) == t1, "the first-callback time stays put");
+
+    mach_timebase_info_data_t tb;
+    mach_timebase_info(&tb);
+    double gap_ms = (double)ar_engine_take_max_callback_interval(r.e) * tb.numer / tb.denom / 1e6;
+    CHECK(gap_ms >= 19.0, "a 20 ms pause between callbacks is measured as the longest gap");
+    CHECK(ar_engine_take_max_callback_interval(r.e) == 0, "taking the longest gap resets it");
+    ar_engine_take_max_process_time(r.e);
+
+    ar_engine_take_input_zero_run(r.e, 0);
+    ar_engine_take_output_zero_run(r.e, 0);
+    fx_run(&r, 0, 0.0f, 10);
+    CHECK(ar_engine_take_input_zero_run(r.e, 0) == 12 * FX_FRAMES, "exact silence on an input is measured as a run");
+    CHECK(ar_engine_take_output_zero_run(r.e, 0) >= 10 * FX_FRAMES, "and silence on an output too");
+    fx_run(&r, 1000, 0.5f, 5);
+    ar_engine_take_input_zero_run(r.e, 0);
+    fx_run(&r, 1000, 0.5f, 5);
+    CHECK(ar_engine_take_input_zero_run(r.e, 0) == 0, "real signal is never counted as silence");
+    CHECK(ar_engine_missing_buffer_count(r.e) == 0, "a complete buffer list counts no missing buffers");
+    fx_rig_free(&r);
+
+    fx_rig bad = fx_rig_make(0);
+    ar_engine_clear_topology(bad.e);
+    ar_engine_set_input_map(bad.e, 0, 1, 3, 0, -1, -1); // buffer 3 doesn't exist
+    ar_engine_set_output_map(bad.e, 0, 2, 0, 0, 0, 1);
+    fx_run(&bad, 0, 0.5f, 4);
+    CHECK(ar_engine_missing_buffer_count(bad.e) == 4, "every callback with a missing buffer is counted");
+    fx_rig_free(&bad);
+}
+
 // Rig resembling the real thing (1500 frames: deliberately not a multiple of the block size):
 //   in  buf0 2ch: interface  (ch0 = mic)
 //   in  buf1 2ch: piano      (L, R)
@@ -310,6 +355,7 @@ int main(void) {
     free_list(out);
 
     test_effects();
+    test_diagnostics();
 
     if (failures) {
         printf("\n%d FAILED\n", failures);

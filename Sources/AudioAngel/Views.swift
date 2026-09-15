@@ -170,7 +170,7 @@ struct StatusBar: View {
             Button {
                 model.resetOverloads()
                 model.meters.resetClips()
-                model.engine.restart()
+                model.engine.restart(reason: "user pressed ↻ (status bar)")
             } label: {
                 Image(systemName: "arrow.clockwise")
             }
@@ -293,10 +293,39 @@ struct SettingsView: View {
                 } label: {
                     Text("Setup checklist").font(.headline)
                 }
+                GroupBox {
+                    DiagnosticsSettings().padding(8)
+                } label: {
+                    Text("Diagnostics").font(.headline)
+                }
             }
             .padding(20)
         }
         .frame(width: 600, height: 680)
+    }
+}
+
+struct DiagnosticsSettings: View {
+    var body: some View {
+        let file = DiagnosticLog.shared.fileURL
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Audio Angel keeps a log of every restart, device change, dropout and clip, with the reason for each, so a gap in the sound can be traced to its cause. It holds device names and timings, never audio.")
+                .font(.callout)
+                .foregroundColor(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            HStack {
+                Text(file?.path ?? "Not recording")
+                    .font(.system(.caption, design: .monospaced))
+                    .lineLimit(1)
+                    .truncationMode(.head)
+                    .textSelection(.enabled)
+                Spacer()
+                Button("Show log folder") {
+                    if let file { NSWorkspace.shared.activateFileViewerSelecting([file]) }
+                }
+                .disabled(file == nil)
+            }
+        }
     }
 }
 
@@ -352,7 +381,7 @@ struct EngineSettings: View {
                     .foregroundColor(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
                 Spacer()
-                Button("Restart audio engine") { model.engine.restart() }
+                Button("Restart audio engine") { model.engine.restart(reason: "user pressed Restart (Settings)") }
             }
         }
     }

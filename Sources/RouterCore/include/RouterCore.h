@@ -62,6 +62,23 @@ float ar_engine_take_input_reduction(ar_engine *e, int in, uint32_t effect);
 uint64_t ar_engine_callback_count(ar_engine *e);
 uint64_t ar_engine_clip_count(ar_engine *e);
 
+// --- Diagnostics (any thread). Times are mach_absolute_time() ticks. -------
+// When the most recent callback began; 0 if there has never been one.
+uint64_t ar_engine_last_callback_time(ar_engine *e);
+// When the first callback after the latest ar_engine_start began; 0 until it happens.
+uint64_t ar_engine_first_callback_time(ar_engine *e);
+// Longest gap between the starts of two consecutive callbacks since the last call.
+uint64_t ar_engine_take_max_callback_interval(ar_engine *e);
+// Longest time spent inside one callback since the last call.
+uint64_t ar_engine_take_max_process_time(ar_engine *e);
+// Longest run of exact digital silence (every sample 0.0) since the last call, in
+// frames. A run still going when taken counts from where it began.
+uint32_t ar_engine_take_input_zero_run(ar_engine *e, int in);
+uint32_t ar_engine_take_output_zero_run(ar_engine *e, int out);
+// Callbacks in which a mapped input or output channel had no buffer, or a buffer
+// too short for the callback. Should always stay 0.
+uint64_t ar_engine_missing_buffer_count(ar_engine *e);
+
 // --- The render function. Exposed so it can be tested without hardware. ----
 void ar_engine_process(ar_engine *e, const AudioBufferList *in, AudioBufferList *out);
 

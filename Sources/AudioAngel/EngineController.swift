@@ -23,12 +23,17 @@ private func khz(_ rate: Double) -> String {
     rate.truncatingRemainder(dividingBy: 1000) == 0 ? "\(Int(rate / 1000)) kHz" : String(format: "%.1f kHz", rate / 1000)
 }
 
+private let log = DiagnosticLog.shared
+
 /// Owns the private aggregate device and the C engine running on it.
 ///
 /// Everything here runs on one serial queue (`hal`), so Core Audio calls never
 /// race each other and never block the UI. The design goal is that it heals on
 /// its own: devices coming and going, sample-rate changes, sleep/wake and a
 /// stalled audio thread all end in an automatic rebuild.
+///
+/// Every decision to stop the audio is written to the diagnostic log with what
+/// triggered it, and every restart logs how long the audio was actually silent.
 final class EngineController {
     static let aggregateUIDPrefix = "com.philipwarda.audioangel.engine"
     static let maxInputs = Int(AR_MAX_INPUTS)
@@ -58,6 +63,14 @@ final class EngineController {
             bufferFrames = c.bufferFrames
             clockUID = c.clockDeviceUID
         }
+
+        var logged: [String: Any] {
+            func ends(_ list: [End]) -> [String] {
+                list.map { "\($0.uid ?? "none") ch\($0.first + 1)x\($0.width)" }
+            }
+            return ["inputs": ends(inputs), "outputs": ends(outputs), "sample_rate": sampleRate,
+                    "buffer_frames": bufferFrames, "clock_uid": clockUID ?? "auto"]
+        }
     }
 
     /// What we check to decide whether a device-list change affects us.
@@ -66,6 +79,10 @@ final class EngineController {
         var objectID: AudioObjectID
         var inputs: Int
         var outputs: Int
+
+        var logged: [String: Any] {
+            ["uid": uid, "id": Int(objectID), "in_ch": inputs, "out_ch": outputs, "present": objectID != 0]
+        }
     }
 
     /// The aggregate as built, and where each device's channels ended up in it.
@@ -96,6 +113,7 @@ final class EngineController {
     private var builtSignature: [DeviceSignature] = []
     private var virtualUIDs: Set<String> = []
     private var rebuildItem: DispatchWorkItem?
+    private var pendingReason: String?
     private var deviceListeners: [Listener] = []
     private var systemListeners: [Listener] = []
     private var watchdog: DispatchSourceTimer?
@@ -109,13 +127,33 @@ final class EngineController {
     private var generation = 0
     /// When audio last (re)started; overloads just after it aren't counted.
     private var runningSince = Date.distantPast
+    /// Mach time of the last callback before audio was stopped; 0 while audio flows.
+    private var silentSince: UInt64 = 0
+    private var silenceReason = ""
+    /// uid → name, to tell what appeared or vanished in a device-list change.
+    private var knownDevices: [String: String] = [:]
+
+    private let statusLock = NSLock()
+    private var statusSnapshot = EngineStatus()
 
     private var status = EngineStatus() {
         didSet {
             guard status != oldValue else { return }
             let snapshot = status
+            statusLock.lock(); statusSnapshot = snapshot; statusLock.unlock()
+            if snapshot.state != oldValue.state || snapshot.message != oldValue.message
+                || snapshot.warnings != oldValue.warnings || snapshot.notes != oldValue.notes {
+                log.event("status", ["state": snapshot.state.rawValue, "message": snapshot.message,
+                                     "warnings": snapshot.warnings, "notes": snapshot.notes])
+            }
             DispatchQueue.main.async { self.onStatus?(snapshot) }
         }
+    }
+
+    /// The latest status, readable from any thread.
+    var currentStatus: EngineStatus {
+        statusLock.lock(); defer { statusLock.unlock() }
+        return statusSnapshot
     }
 
     init() {
@@ -129,9 +167,10 @@ final class EngineController {
         hal.async {
             guard !self.started else { return }
             self.started = true
+            self.knownDevices = Dictionary(AudioDeviceInfo.all().map { ($0.uid, $0.name) }, uniquingKeysWith: { a, _ in a })
             self.installSystemListeners()
             self.startWatchdog()
-            self.scheduleRebuild(after: 0)
+            self.scheduleRebuild(after: 0, reason: "app started")
         }
     }
 
@@ -141,32 +180,37 @@ final class EngineController {
         hal.async {
             self.config = newConfig
             guard self.started else { return }
-            if Topology(newConfig) == self.builtTopology {
+            let topology = Topology(newConfig)
+            if topology == self.builtTopology {
                 self.pushParams()
-            } else if !self.tryRemap() {
+                return
+            }
+            log.event("config_topology_changed", ["from": self.builtTopology?.logged ?? NSNull(), "to": topology.logged])
+            if !self.tryRemap() {
                 self.silenceRoutes()
-                self.scheduleRebuild(after: 0.25)
+                self.scheduleRebuild(after: 0.25, reason: "settings changed which devices, channels, rate or buffer are used")
             }
         }
     }
 
-    func restart(after delay: TimeInterval = 0) {
+    func restart(after delay: TimeInterval = 0, reason: String) {
         hal.async {
             guard self.started else { return }
-            self.scheduleRebuild(after: delay)
+            self.scheduleRebuild(after: delay, reason: reason)
         }
     }
 
     /// Stops audio and destroys the aggregate. Blocks until done.
     func shutdown() {
         hal.sync {
+            log.event("engine_shutdown")
             self.started = false
             self.rebuildItem?.cancel()
             self.watchdog?.cancel()
             self.watchdog = nil
             self.systemListeners.forEach(self.remove)
             self.systemListeners = []
-            self.teardown()
+            self.teardown(reason: "app quitting")
             self.status = EngineStatus(state: .stopped, message: "Stopped")
         }
     }
@@ -212,9 +256,12 @@ final class EngineController {
 
     // MARK: - Building
 
-    private func scheduleRebuild(after delay: TimeInterval) {
+    private func scheduleRebuild(after delay: TimeInterval, reason: String) {
+        log.event("rebuild_scheduled", ["reason": reason, "delay_ms": Int(delay * 1000),
+                                        "replaces_pending": pendingReason ?? NSNull()])
         rebuildItem?.cancel()
-        let item = DispatchWorkItem { [weak self] in self?.rebuild() }
+        pendingReason = reason
+        let item = DispatchWorkItem { [weak self] in self?.rebuild(reason: reason) }
         rebuildItem = item
         hal.asyncAfter(deadline: .now() + delay, execute: item)
     }
@@ -247,10 +294,13 @@ final class EngineController {
             ?? devices[0]).uid
     }
 
-    private func rebuild() {
+    private func rebuild(reason: String) {
         rebuildItem = nil
+        pendingReason = nil
         guard started, let cfg = config else { return }
-        teardown()
+        let began = mach_absolute_time()
+        log.event("rebuild_begin", ["reason": reason, "devices": DiagnosticInfo.allDevices()])
+        teardown(reason: reason)
 
         let devices = AudioDeviceInfo.all()
         let byUID = Dictionary(devices.map { ($0.uid, $0) }, uniquingKeysWith: { a, _ in a })
@@ -269,6 +319,7 @@ final class EngineController {
 
         let used = usedDevices(cfg, byUID)
         guard !used.isEmpty else {
+            log.event("rebuild_waiting", ["reason": "no assigned device is present"])
             status = EngineStatus(state: .waiting,
                                   message: cfg.inputs.isEmpty && cfg.outputs.isEmpty ? "Add an input and an output" : "Waiting for devices…",
                                   warnings: warnings)
@@ -280,8 +331,14 @@ final class EngineController {
         var notes: [String] = []
         for uid in used {
             guard let d = byUID[uid] else { continue }
-            if !CA.setNominalRate(d.objectID, cfg.sampleRate) {
-                if CA.supportsRate(d.objectID, cfg.sampleRate) {
+            let before = CA.nominalRate(d.objectID)
+            let ok = CA.setNominalRate(d.objectID, cfg.sampleRate)
+            let supported = CA.supportsRate(d.objectID, cfg.sampleRate)
+            log.event("set_device_rate", ["device": d.name, "uid": uid, "before": before ?? NSNull(),
+                                          "requested": cfg.sampleRate, "supported": supported, "ok": ok,
+                                          "after": CA.nominalRate(d.objectID) ?? NSNull()])
+            if !ok {
+                if supported {
                     warnings.append("\(d.name) couldn't switch to \(khz(cfg.sampleRate)). Another app may be holding it.")
                 } else {
                     // The aggregate's drift compensation resamples it; this is fine.
@@ -305,15 +362,24 @@ final class EngineController {
         ]
         var agg: AudioObjectID = 0
         let createStatus = AudioHardwareCreateAggregateDevice(description as CFDictionary, &agg)
+        log.event("aggregate_created", ["status": Int(createStatus), "id": Int(agg),
+                                        "clock": byUID[clock]?.name ?? clock,
+                                        "sub_devices": order.map { uid -> [String: Any] in ["name": byUID[uid]?.name ?? uid, "uid": uid, "drift_compensation": uid != clock] }])
         guard createStatus == noErr, agg != 0 else {
-            return fail("Couldn't create the routing device (error \(createStatus))", warnings)
+            return fail("Couldn't create the routing device (error \(createStatus))", warnings, step: "create_aggregate")
         }
         aggregateID = agg
 
         let expectedIn = order.reduce(0) { $0 + (byUID[$1]?.inputChannels ?? 0) }
         let expectedOut = order.reduce(0) { $0 + (byUID[$1]?.outputChannels ?? 0) }
-        guard waitForAggregate(agg, inputs: expectedIn, outputs: expectedOut, timeout: 3) else {
-            return fail("The routing device didn't come up — a device may be busy or unplugging", warnings)
+        let waitBegan = mach_absolute_time()
+        let cameUp = waitForAggregate(agg, inputs: expectedIn, outputs: expectedOut, timeout: 3)
+        log.event("aggregate_ready", ["ok": cameUp, "waited_ms": DiagnosticLog.ms(mach_absolute_time() - waitBegan),
+                                      "expected_in": expectedIn, "expected_out": expectedOut,
+                                      "got_in": CA.streamLayout(agg, kAudioObjectPropertyScopeInput).reduce(0, +),
+                                      "got_out": CA.streamLayout(agg, kAudioObjectPropertyScopeOutput).reduce(0, +)])
+        guard cameUp else {
+            return fail("The routing device didn't come up — a device may be busy or unplugging", warnings, step: "wait_for_aggregate")
         }
 
         CA.setNominalRate(agg, cfg.sampleRate)
@@ -323,7 +389,7 @@ final class EngineController {
         CA.set(agg, CA.addr(kAudioDevicePropertyBufferFrameSize), UInt32(frames))
 
         guard streamsAreFloat32(agg) else {
-            return fail("A device uses a sample format Audio Angel can't handle", warnings)
+            return fail("A device uses a sample format Audio Angel can't handle", warnings, step: "check_formats")
         }
 
         // The aggregate lays channels out device by device, in sub-device order.
@@ -342,7 +408,7 @@ final class EngineController {
         let inLayout = CA.streamLayout(agg, kAudioObjectPropertyScopeInput)
         let outLayout = CA.streamLayout(agg, kAudioObjectPropertyScopeOutput)
         guard inLayout.reduce(0, +) == inAcc, outLayout.reduce(0, +) == outAcc else {
-            return fail("Channel layout mismatch (in \(inLayout.reduce(0, +))/\(inAcc), out \(outLayout.reduce(0, +))/\(outAcc))", warnings)
+            return fail("Channel layout mismatch (in \(inLayout.reduce(0, +))/\(inAcc), out \(outLayout.reduce(0, +))/\(outAcc))", warnings, step: "channel_layout")
         }
 
         let g = Graph(aggregate: agg, order: actualOrder,
@@ -356,7 +422,7 @@ final class EngineController {
 
         let startStatus = ar_engine_start(core, agg)
         guard startStatus == noErr else {
-            return fail("Couldn't start audio (error \(startStatus))", warnings)
+            return fail("Couldn't start audio (error \(startStatus))", warnings, step: "start_ioproc")
         }
         graph = g
         runningSince = Date()
@@ -366,13 +432,20 @@ final class EngineController {
         stalledTicks = 0
         lastCallbacks = ar_engine_callback_count(core)
         let actualFrames = Int(CA.get(agg, CA.addr(kAudioDevicePropertyBufferFrameSize), UInt32(0)) ?? UInt32(frames))
+        let inLatency = latencyMs(agg, kAudioObjectPropertyScopeInput, frames: actualFrames, rate: actualRate)
+        let outLatency = latencyMs(agg, kAudioObjectPropertyScopeOutput, frames: actualFrames, rate: actualRate)
+        log.event("engine_started", ["reason": reason, "build_ms": DiagnosticLog.ms(mach_absolute_time() - began),
+                                     "sample_rate": actualRate, "buffer_frames": actualFrames,
+                                     "latency_in_ms": inLatency, "latency_out_ms": outLatency,
+                                     "aggregate": DiagnosticInfo.device(agg)])
+        awaitFirstCallback(generation: generation, restart: "rebuild")
         status = EngineStatus(
             state: .running,
             message: "Routing \(order.count) device\(order.count == 1 ? "" : "s")",
             sampleRate: actualRate,
             bufferFrames: actualFrames,
-            inputLatencyMs: latencyMs(agg, kAudioObjectPropertyScopeInput, frames: actualFrames, rate: actualRate),
-            outputLatencyMs: latencyMs(agg, kAudioObjectPropertyScopeOutput, frames: actualFrames, rate: actualRate),
+            inputLatencyMs: inLatency,
+            outputLatencyMs: outLatency,
             clockDeviceName: byUID[clock]?.name ?? "",
             devicesInUse: actualOrder.compactMap { byUID[$0]?.name },
             warnings: warnings,
@@ -391,13 +464,17 @@ final class EngineController {
         guard Set(usedDevices(cfg, byUID)) == Set(g.order) else { return false }
 
         ar_engine_stop(core)
+        markSilence(reason: "channel remap")
         applyMaps(cfg, g)
         pushParams()
-        guard ar_engine_start(core, g.aggregate) == noErr else { return false }
+        let ok = ar_engine_start(core, g.aggregate) == noErr
+        log.event("remap", ["ok": ok])
+        guard ok else { return false }
         runningSince = Date()
         builtTopology = Topology(cfg)
         builtSignature = signature(cfg, byUID)
         lastCallbacks = ar_engine_callback_count(core)
+        awaitFirstCallback(generation: generation, restart: "remap")
         return true
     }
 
@@ -423,36 +500,74 @@ final class EngineController {
             return (1, a.0, a.1, -1, -1)
         }
 
+        var mapped: [[String: Any]] = []
         for (i, slot) in cfg.inputs.prefix(Self.maxInputs).enumerated() {
-            if let m = map(slot, offsets: g.inOffsets, counts: g.inCounts, layout: g.inLayout) {
-                ar_engine_set_input_map(core, Int32(i), m.0, m.1, m.2, m.3, m.4)
-            }
+            let m = map(slot, offsets: g.inOffsets, counts: g.inCounts, layout: g.inLayout)
+            if let m { ar_engine_set_input_map(core, Int32(i), m.0, m.1, m.2, m.3, m.4) }
+            mapped.append(["strip": slot.name, "kind": "input", "mapped": m != nil])
         }
         for (o, slot) in cfg.outputs.prefix(Self.maxOutputs).enumerated() {
-            if let m = map(slot, offsets: g.outOffsets, counts: g.outCounts, layout: g.outLayout) {
-                ar_engine_set_output_map(core, Int32(o), m.0, m.1, m.2, m.3, m.4)
-            }
+            let m = map(slot, offsets: g.outOffsets, counts: g.outCounts, layout: g.outLayout)
+            if let m { ar_engine_set_output_map(core, Int32(o), m.0, m.1, m.2, m.3, m.4) }
+            mapped.append(["strip": slot.name, "kind": "output", "mapped": m != nil])
         }
+        log.event("channel_map", ["strips": mapped, "in_layout": g.inLayout, "out_layout": g.outLayout])
     }
 
-    private func fail(_ message: String, _ warnings: [String]) {
-        teardown()
+    private func fail(_ message: String, _ warnings: [String], step: String) {
+        teardown(reason: "build failed at \(step)")
         failures += 1
         let retry = min(pow(2, Double(failures)), 15)
+        log.event("rebuild_failed", ["step": step, "message": message, "failures_in_a_row": failures, "retry_s": retry])
         status = EngineStatus(state: .error, message: "\(message). Retrying in \(Int(retry)) s", warnings: warnings)
-        scheduleRebuild(after: retry)
+        scheduleRebuild(after: retry, reason: "retry after failure at \(step)")
     }
 
-    private func teardown() {
+    /// Remembers when the audio went quiet, the first time it does, until it resumes.
+    private func markSilence(reason: String) {
+        guard silentSince == 0 else { return }
+        let last = ar_engine_last_callback_time(core)
+        silentSince = last != 0 ? last : mach_absolute_time()
+        silenceReason = reason
+    }
+
+    private func teardown(reason: String) {
         generation += 1
         deviceListeners.forEach(remove)
         deviceListeners = []
-        if ar_engine_is_running(core) { ar_engine_stop(core) }
+        if ar_engine_is_running(core) {
+            ar_engine_stop(core)
+            markSilence(reason: reason)
+            log.event("audio_stopped", ["reason": reason,
+                                        "ms_since_last_callback": DiagnosticLog.ms(from: ar_engine_last_callback_time(core), to: mach_absolute_time()) ?? NSNull()])
+        }
         if aggregateID != 0 {
             AudioHardwareDestroyAggregateDevice(aggregateID)
             aggregateID = 0
         }
         graph = nil
+    }
+
+    /// Logs the moment sound is flowing again, and exactly how long it was silent.
+    private func awaitFirstCallback(generation gen: Int, restart: String, polls: Int = 0) {
+        guard gen == generation else { return }
+        let first = ar_engine_first_callback_time(core)
+        if first != 0 {
+            if silentSince != 0 {
+                log.event("audio_resumed", ["silence_ms": DiagnosticLog.ms(from: silentSince, to: first) ?? NSNull(),
+                                            "stopped_because": silenceReason, "restart": restart])
+            } else {
+                log.event("audio_flowing", ["restart": restart])
+            }
+            silentSince = 0
+            silenceReason = ""
+        } else if polls < 1000 {
+            hal.asyncAfter(deadline: .now() + 0.005) { [weak self] in
+                self?.awaitFirstCallback(generation: gen, restart: restart, polls: polls + 1)
+            }
+        } else {
+            log.event("audio_not_flowing", ["waited_s": 5, "restart": restart])
+        }
     }
 
     private func waitForAggregate(_ agg: AudioObjectID, inputs: Int, outputs: Int, timeout: TimeInterval) -> Bool {
@@ -471,6 +586,8 @@ final class EngineController {
             for stream in CA.getArray(device, CA.addr(kAudioDevicePropertyStreams, scope), AudioObjectID(0)) {
                 guard let f = CA.get(stream, CA.addr(kAudioStreamPropertyVirtualFormat), AudioStreamBasicDescription()) else { continue }
                 if f.mFormatID != kAudioFormatLinearPCM || f.mFormatFlags & kAudioFormatFlagIsFloat == 0 || f.mBitsPerChannel != 32 {
+                    log.event("unsupported_stream_format", ["stream": Int(stream), "format": DiagnosticInfo.fourCC(f.mFormatID),
+                                                            "flags": Int(f.mFormatFlags), "bits": Int(f.mBitsPerChannel)])
                     return false
                 }
             }
@@ -495,6 +612,9 @@ final class EngineController {
     /// inside such a call, both would wait on each other forever. So listeners get
     /// their own queue and only ever hand work to `hal` asynchronously.
     private let notifyQueue = DispatchQueue(label: "com.philipwarda.audioangel.notify")
+    /// Raw property changes are read and logged here, off both of the queues above.
+    private let observeQueue = DispatchQueue(label: "com.philipwarda.audioangel.observe", qos: .utility)
+    private var observeWindows: [String: (start: UInt64, count: Int, suppressed: Int)] = [:] // observeQueue only
 
     private func listen(_ object: AudioObjectID, _ selector: AudioObjectPropertySelector,
                         _ handler: @escaping () -> Void) -> Listener? {
@@ -502,6 +622,52 @@ final class EngineController {
         let block: AudioObjectPropertyListenerBlock = { [hal] _, _ in hal.async(execute: handler) }
         guard AudioObjectAddPropertyListenerBlock(object, &address, notifyQueue, block) == noErr else { return nil }
         return Listener(object: object, address: address, block: block)
+    }
+
+    /// Logs every property change on an object, whatever it is. Decides nothing:
+    /// this is the raw record of what Core Audio said, to check the engine's
+    /// decisions against.
+    private func observeAll(_ object: AudioObjectID, label: String) -> Listener? {
+        var address = AudioObjectPropertyAddress(mSelector: kAudioObjectPropertySelectorWildcard,
+                                                 mScope: kAudioObjectPropertyScopeWildcard,
+                                                 mElement: kAudioObjectPropertyElementWildcard)
+        let block: AudioObjectPropertyListenerBlock = { [weak self] count, addresses in
+            let when = Date(), ticks = mach_absolute_time()
+            let changed = Array(UnsafeBufferPointer(start: addresses, count: Int(count)))
+            self?.observeQueue.async { self?.logProperties(object, label, changed, when, ticks) }
+        }
+        guard AudioObjectAddPropertyListenerBlock(object, &address, notifyQueue, block) == noErr else { return nil }
+        return Listener(object: object, address: address, block: block)
+    }
+
+    private func logProperties(_ object: AudioObjectID, _ label: String, _ changed: [AudioObjectPropertyAddress],
+                               _ when: Date, _ ticks: UInt64) {
+        for a in changed {
+            // At most 20 of the same change per second; the rest are counted, not listed.
+            let key = "\(object)/\(a.mSelector)/\(a.mScope)/\(a.mElement)"
+            var w = observeWindows[key] ?? (start: ticks, count: 0, suppressed: 0)
+            if DiagnosticLog.seconds(ticks &- w.start) >= 1 {
+                if w.suppressed > 0 {
+                    log.event("hal_property_suppressed", ["object": label, "property": DiagnosticInfo.propertyName(a.mSelector),
+                                                          "count": w.suppressed])
+                }
+                w = (start: ticks, count: 0, suppressed: 0)
+            }
+            w.count += 1
+            if w.count > 20 {
+                w.suppressed += 1
+                observeWindows[key] = w
+                continue
+            }
+            observeWindows[key] = w
+            log.event("hal_property", [
+                "object": label,
+                "property": DiagnosticInfo.propertyName(a.mSelector),
+                "scope": DiagnosticInfo.fourCC(a.mScope),
+                "element": Int(a.mElement),
+                "value": DiagnosticInfo.value(of: a.mSelector, on: object) ?? NSNull(),
+            ], at: when, ticks: ticks)
+        }
     }
 
     private func remove(_ listener: Listener) {
@@ -515,43 +681,85 @@ final class EngineController {
             listen(CA.system, kAudioHardwarePropertyDefaultOutputDevice) { [weak self] in
                 DispatchQueue.main.async { self?.onSystemDevicesChanged?() }
             },
+            observeAll(CA.system, label: "system"),
         ].compactMap { $0 }
     }
 
     private func systemDevicesChanged() {
         DispatchQueue.main.async { self.onSystemDevicesChanged?() }
-        guard started, let cfg = config else { return }
         let devices = AudioDeviceInfo.all()
+        let now = Dictionary(devices.map { ($0.uid, $0.name) }, uniquingKeysWith: { a, _ in a })
+        let added = now.filter { knownDevices[$0.key] == nil }.map { ["name": $0.value, "uid": $0.key] }
+        let removed = knownDevices.filter { now[$0.key] == nil }.map { ["name": $0.value, "uid": $0.key] }
+        knownDevices = now
+        guard started, let cfg = config else { return }
         let byUID = Dictionary(devices.map { ($0.uid, $0) }, uniquingKeysWith: { a, _ in a })
-        if signature(cfg, byUID) != builtSignature {
+        let sig = signature(cfg, byUID)
+        let affects = sig != builtSignature
+        var fields: [String: Any] = ["added": added, "removed": removed, "affects_engine": affects]
+        if affects {
+            fields["before"] = builtSignature.map(\.logged)
+            fields["after"] = sig.map(\.logged)
+            fields["action"] = "rebuild in 750 ms"
+        } else {
+            fields["action"] = "none"
+        }
+        log.event("devices_changed", fields)
+        if affects {
             // USB devices often appear before they're ready; give them a moment.
             status.message = "Devices changed — reconnecting…"
-            scheduleRebuild(after: 0.75)
+            scheduleRebuild(after: 0.75, reason: "device list changed: "
+                            + (removed.map { "removed \($0["name"] ?? "")" } + added.map { "added \($0["name"] ?? "")" }
+                               + (added.isEmpty && removed.isEmpty ? ["a device in use changed"] : [])).joined(separator: ", "))
         }
     }
 
     private func installDeviceListeners(_ g: Graph, _ byUID: [String: AudioDeviceInfo]) {
         var listeners: [Listener?] = []
+        let gen = generation
         listeners.append(listen(g.aggregate, kAudioDeviceProcessorOverload) { [weak self] in
             // Devices settling in the first moments after a start can trip this;
             // that isn't a dropout during playing, so it isn't counted.
-            guard let self, Date().timeIntervalSince(self.runningSince) > 2 else { return }
+            guard let self else { return }
+            let sinceStart = Date().timeIntervalSince(self.runningSince)
+            let counted = sinceStart > 2 // unchanged from v1.0; the log notes stale engines separately
+            log.event("overload", ["seconds_since_start": (sinceStart * 1000).rounded() / 1000, "counted": counted,
+                                   "stale_engine": gen != self.generation])
+            guard counted else { return }
             DispatchQueue.main.async { self.onOverload?() }
         })
-        let watched = [g.aggregate] + g.order.compactMap { byUID[$0]?.objectID }
-        let gen = generation
-        for object in watched {
+        let names = [g.aggregate: "Audio Angel Engine"].merging(
+            g.order.compactMap { uid in byUID[uid].map { ($0.objectID, $0.name) } }, uniquingKeysWith: { a, _ in a })
+        for (object, name) in names {
+            let rateAtBuild = CA.nominalRate(object)
             listeners.append(listen(object, kAudioDevicePropertyDeviceIsAlive) { [weak self] in
-                guard let self, gen == self.generation, !CA.isAlive(object) else { return }
+                guard let self else { return }
+                let alive = CA.isAlive(object)
+                let current = gen == self.generation
+                let act = current && !alive
+                log.event("device_alive_changed", ["device": name, "alive": alive,
+                                                   "action": !current ? "ignored: from a previous engine" : act ? "rebuild in 500 ms" : "none"])
+                guard act else { return }
                 self.status.message = "A device went away — reconnecting…"
-                self.scheduleRebuild(after: 0.5)
+                self.scheduleRebuild(after: 0.5, reason: "\(name) reported it is no longer alive")
             })
             listeners.append(listen(object, kAudioDevicePropertyNominalSampleRate) { [weak self] in
-                guard let self, gen == self.generation,
-                      let rate = CA.nominalRate(object), abs(rate - g.requestedRate) > 0.5 else { return }
+                guard let self else { return }
+                let rate = CA.nominalRate(object)
+                let current = gen == self.generation
+                let differs = rate.map { abs($0 - g.requestedRate) > 0.5 } ?? false
+                let act = current && differs
+                log.event("sample_rate_changed", [
+                    "device": name, "rate": rate ?? NSNull(), "rate_at_build": rateAtBuild ?? NSNull(),
+                    "engine_rate": g.requestedRate,
+                    "action": !current ? "ignored: from a previous engine"
+                        : act ? "rebuild in 1000 ms (rate differs from engine rate)" : "none (rate matches engine rate)",
+                ])
+                guard act else { return }
                 self.status.message = "Sample rate changed elsewhere — resetting…"
-                self.scheduleRebuild(after: 1.0)
+                self.scheduleRebuild(after: 1.0, reason: "\(name) reported sample rate \(rate.map { String(Int($0)) } ?? "?") Hz, engine runs at \(Int(g.requestedRate)) Hz")
             })
+            listeners.append(observeAll(object, label: name))
         }
         deviceListeners = listeners.compactMap { $0 }
     }
@@ -573,10 +781,17 @@ final class EngineController {
         let count = ar_engine_callback_count(core)
         if count == lastCallbacks {
             stalledTicks += 1
+            let agg = graph?.aggregate ?? 0
+            log.event("watchdog_no_callbacks", [
+                "seconds": stalledTicks, "callbacks": Int(count),
+                "aggregate_alive": agg != 0 && CA.isAlive(agg),
+                "aggregate_running": agg != 0 ? Int(CA.get(agg, CA.addr(kAudioDevicePropertyDeviceIsRunning), UInt32(0)) ?? 0) : 0,
+                "action": stalledTicks >= 3 ? "rebuild now" : "keep watching",
+            ])
             if stalledTicks >= 3 {
                 stalledTicks = 0
                 status.message = "Audio stalled — restarting…"
-                scheduleRebuild(after: 0)
+                scheduleRebuild(after: 0, reason: "watchdog: no audio callbacks for 3 s")
             }
         } else {
             stalledTicks = 0

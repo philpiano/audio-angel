@@ -1,6 +1,6 @@
 <img width="100" height="100" alt="Logo" src="https://github.com/user-attachments/assets/c46f847e-2a5d-4c9e-955e-f3a88d50e523" />
 
-# Audio Angel v1.0
+# Audio Angel v1.1
 
 ![Audio Angel's main window: four input strips (Vocal Mic, Yamaha Piano, Mac / iPad, Zoom) and two output strips (Teacher, Student)](docs/screenshot.png)
 
@@ -196,12 +196,41 @@ scale.
 
 ---
 
+## Diagnostic log
+
+If the sound ever stops, Audio Angel has recorded why. Every launch writes one log
+file, **`logs/audio-angel-<date>_<time>.jsonl`** in this project folder (or
+`~/Library/Logs/Audio Angel/` if the app lives somewhere else). Settings ›
+Diagnostics › **Show log folder** opens it. The newest 60 sessions are kept; the
+folder is ignored by git.
+
+It's [JSON Lines](https://jsonlines.org): one event per line, readable in any text
+editor and easy to analyse. Every line has `t` (time, to the millisecond), `s`
+(seconds since launch) and `ev` (what happened). The events that explain a gap:
+
+| Event | What it records |
+|---|---|
+| `rebuild_scheduled` | The engine decided to restart, and **the exact trigger** (a device vanished, a sample rate changed, the watchdog, a setting, the ↻ button…) |
+| `sample_rate_changed`, `device_alive_changed`, `devices_changed` | Each notification the engine acted on or ignored, with the values it saw and its decision |
+| `hal_property` | Every raw change Core Audio reported on the devices in use, whether or not it caused anything |
+| `audio_stopped` / `audio_resumed` | When sound stopped, why, and **how long it was silent**, measured on the audio thread's own clock |
+| `set_device_rate`, `aggregate_created`, `aggregate_ready`, `engine_started`, `rebuild_failed` | Each step of a restart and how long it took |
+| `heartbeat` (every 2 s) | Callbacks on time, the longest gap between them, each strip's peak level and any stretch of exact digital silence, clips, dropouts |
+| `overload`, `watchdog_no_callbacks` | Missed audio deadlines and stalls |
+| `config`, `devices`, `session_start` | Your settings, every device with its rates and latencies, the Mac, other running apps, sleep/wake |
+
+The log holds device names and timings, never audio. Nothing is written from the
+audio thread, so recording can't cause a dropout.
+
+---
+
 ## Checks
 
 ```bash
 ./build.sh test                                               # engine tests only (no hardware)
 "build/Audio Angel.app/Contents/MacOS/AudioAngel" --list-devices
 "build/Audio Angel.app/Contents/MacOS/AudioAngel" --probe      # silent run on the speakers
+"build/Audio Angel.app/Contents/MacOS/AudioAngel" --probe --log DIR  # and check the log explains a forced restart
 "build/Audio Angel.app/Contents/MacOS/AudioAngel" --snapshot out.png           # the window, as a picture
 "build/Audio Angel.app/Contents/MacOS/AudioAngel" --snapshot-settings out.png  # the Settings window
 ```
@@ -213,7 +242,10 @@ the compressor's curve, the limiter's ceiling, switching without clicks).
 `--probe` builds a real engine on the built-in speakers (output only: silent, and no
 microphone prompt). It checks that callbacks arrive at the right rate, rebuilds at a
 new buffer size, confirms the engine stays still when nothing changes, and confirms
-nothing is left behind.
+nothing is left behind. With `--log DIR` it also records a diagnostic log, changes
+the speakers' sample rate behind the engine's back (and restores it), and checks
+that the log attributes the resulting restart to the rate change and measures the
+silence.
 
 ## Limits and next steps
 

@@ -11,6 +11,10 @@ import SwiftUI
 ///                               (silent, output-only, no microphone prompt), runs
 ///                               the engine, rebuilds it at a new buffer size, and
 ///                               reports whether audio callbacks flowed.
+///   AudioAngel --probe --log DIR  the same, recording a diagnostic log in DIR; it also
+///                               changes the speakers' sample rate behind the engine's
+///                               back (then restores it) and checks the log explains
+///                               the restart that follows
 ///   AudioAngel --snapshot FILE           the main window, drawn offscreen to a PNG
 ///                                        (add --demo for the status bar of a running rig)
 ///   AudioAngel --snapshot-settings FILE  the Settings window, likewise
@@ -18,7 +22,10 @@ enum Diagnostics {
     static func run(_ args: [String]) -> Int32? {
         setlinebuf(stdout) // show progress live even when piped
         if args.contains("--list-devices") { listDevices(); return 0 }
-        if args.contains("--probe") { return probe() }
+        if args.contains("--probe") {
+            let i = args.firstIndex(of: "--log")
+            return probe(logDir: i.flatMap { $0 + 1 < args.count ? args[$0 + 1] : nil })
+        }
         if let i = args.firstIndex(of: "--snapshot"), i + 1 < args.count {
             return snapshot(to: args[i + 1], demo: args.contains("--demo"))
         }
@@ -84,7 +91,42 @@ enum Diagnostics {
         }
     }
 
-    static func probe() -> Int32 {
+    /// Reads a probe's log back and checks it tells the story of each restart.
+    static func checkLog(_ file: URL) -> Bool {
+        guard let text = try? String(contentsOf: file) else { print("  FAIL: log unreadable"); return false }
+        var events: [[String: Any]] = []
+        for (n, line) in text.split(separator: "\n").enumerated() {
+            guard let obj = (try? JSONSerialization.jsonObject(with: Data(line.utf8))) as? [String: Any] else {
+                print("  FAIL: log line \(n + 1) is not valid JSON")
+                return false
+            }
+            events.append(obj)
+        }
+        func named(_ ev: String) -> [[String: Any]] { events.filter { $0["ev"] as? String == ev } }
+        var ok = true
+        func expect(_ condition: Bool, _ what: String) {
+            print("  \(condition ? "ok  " : "FAIL") log: \(what)")
+            if !condition { ok = false }
+        }
+        expect(!named("session_start").isEmpty, "session recorded")
+        expect(!named("heartbeat").isEmpty, "heartbeats recorded (\(named("heartbeat").count))")
+        let resumed = named("audio_resumed")
+        expect(!resumed.isEmpty, "every restart logs when sound came back")
+        for r in resumed {
+            print(String(format: "        silent %.1f ms, because: %@", r["silence_ms"] as? Double ?? -1, r["stopped_because"] as? String ?? "?"))
+        }
+        expect(resumed.allSatisfy { ($0["silence_ms"] as? Double ?? -1) >= 0 }, "each silence has a measured duration")
+        let rateEvents = named("sample_rate_changed").filter { ($0["action"] as? String ?? "").hasPrefix("rebuild") }
+        if !rateEvents.isEmpty {
+            expect(resumed.contains { ($0["stopped_because"] as? String ?? "").contains("sample rate") },
+                   "the rate-change restart is attributed to the sample rate")
+        }
+        expect(named("hal_property").contains { $0["property"] as? String == "NominalSampleRate" } || rateEvents.isEmpty,
+               "the raw Core Audio notification is recorded too")
+        return ok
+    }
+
+    static func probe(logDir: String? = nil) -> Int32 {
         let devices = AudioDeviceInfo.all()
         guard let speakers = devices.first(where: { $0.isBuiltIn && $0.outputChannels >= 2 && $0.inputChannels == 0 })
             ?? devices.first(where: { $0.outputChannels >= 2 && $0.inputChannels == 0 }) else {
@@ -105,6 +147,16 @@ enum Diagnostics {
         var config = RouterConfig()
         config.outputs = [SlotConfig(name: "Speakers", deviceUID: speakers.uid, deviceName: speakers.name, stereo: true)]
         config.bufferFrames = 128
+
+        var heartbeat: DiagnosticHeartbeat?
+        if let logDir {
+            DiagnosticLog.shared.start(directory: URL(fileURLWithPath: logDir, isDirectory: true))
+            DiagnosticLog.shared.event("session_start", DiagnosticInfo.session().merging(["probe": true], uniquingKeysWith: { a, _ in a }))
+            DiagnosticLog.shared.event("config", DiagnosticInfo.config(config))
+            heartbeat = DiagnosticHeartbeat(engine: engine, model: nil)
+            heartbeat?.start()
+        }
+
         engine.update(config: config)
         engine.start()
 
@@ -152,7 +204,33 @@ enum Diagnostics {
         RunLoop.main.run(until: Date().addingTimeInterval(2))
         if rebuilds != rebuildsBefore { print("  FAIL: engine kept rebuilding while idle"); ok = false }
 
+        // With a log: provoke a real restart from outside the app and check the log
+        // explains it: what triggered it, and how long the sound was silent.
+        let originalRate = CA.nominalRate(speakers.objectID)
+        if logDir != nil, let original = originalRate {
+            let other = [44100.0, 48000.0, 96000.0].first { abs($0 - original) > 0.5 && CA.supportsRate(speakers.objectID, $0) }
+            if let other {
+                print("Changing \(speakers.name) to \(Int(other)) Hz behind the engine's back…")
+                latest.state = .starting
+                CA.setNominalRate(speakers.objectID, other)
+                if waitForRunning(8) {
+                    RunLoop.main.run(until: Date().addingTimeInterval(1.5))
+                } else {
+                    print("  FAIL: engine didn't come back after the rate change")
+                    ok = false
+                }
+            }
+        }
+
+        heartbeat?.stop()
         engine.shutdown()
+        if let original = originalRate { CA.setNominalRate(speakers.objectID, original) }
+
+        if let logDir, let file = DiagnosticLog.shared.fileURL {
+            DiagnosticLog.shared.stop()
+            ok = checkLog(file) && ok
+            print("  log: \(logDir)/\(file.lastPathComponent)")
+        }
         // The HAL publishes the device list asynchronously; give it a moment.
         var leftovers: [String] = []
         let deadline = Date().addingTimeInterval(2)
